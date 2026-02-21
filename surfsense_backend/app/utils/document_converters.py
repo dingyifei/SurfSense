@@ -180,6 +180,7 @@ async def create_document_chunks(content: str) -> list[Chunk]:
     import asyncio
     import concurrent.futures
     import logging
+    import math
 
     logger = logging.getLogger(__name__)
     chunks_list = config.chunker_instance.chunk(content)
@@ -199,6 +200,9 @@ async def create_document_chunks(content: str) -> list[Chunk]:
                 ),
                 timeout=30,  # 30s timeout per chunk embedding
             )
+            if any(math.isnan(v) for v in embedding):
+                logger.warning(f"NaN in embedding for chunk {i}/{len(chunks_list)} ({len(chunk.text)} chars), skipping")
+                continue
             result.append(Chunk(content=chunk.text, embedding=embedding))
         except asyncio.TimeoutError:
             logger.warning(f"Embedding timeout for chunk {i}/{len(chunks_list)} ({len(chunk.text)} chars), skipping")
