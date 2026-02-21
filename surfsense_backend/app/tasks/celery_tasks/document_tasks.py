@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # stale_notification_cleanup_task detects the missing key and marks the
 # notification + document as failed.
 _doc_heartbeat_redis = None
-HEARTBEAT_TTL_SECONDS = 120  # 2 minutes — same as connector indexing
+HEARTBEAT_TTL_SECONDS = 900  # 15 minutes — embedding can take 7+ min for large docs
 HEARTBEAT_REFRESH_INTERVAL = 60  # Refresh every 60 seconds
 
 

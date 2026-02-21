@@ -312,6 +312,8 @@ class Config:
 
     # Chonkie Configuration | Edit this to your needs
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
+    EMBEDDING_DIMENSIONS = os.getenv("EMBEDDING_DIMENSIONS")  # For Matryoshka dimension truncation
+
     # Azure OpenAI credentials from environment variables
     AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
     AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
@@ -323,10 +325,55 @@ class Config:
     if AZURE_OPENAI_API_KEY:
         embedding_kwargs["azure_api_key"] = AZURE_OPENAI_API_KEY
 
+    # OpenAI-compatible API support (LM Studio, Ollama, vLLM, etc.)
+    # Use EMBEDDING_BASE_URL / EMBEDDING_API_KEY to avoid polluting
+    # LiteLLM's global OPENAI_BASE_URL which overrides per-model api_base.
+    _openai_base_url = os.getenv("EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    _openai_api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if _openai_base_url:
+        embedding_kwargs["base_url"] = _openai_base_url
+    if _openai_api_key:
+        embedding_kwargs["api_key"] = _openai_api_key
+
+    # For custom OpenAI-compatible models, Chonkie requires dimension/tokenizer/max_tokens
+    if EMBEDDING_DIMENSIONS:
+        import tiktoken
+        embedding_kwargs["dimension"] = int(EMBEDDING_DIMENSIONS)
+        embedding_kwargs["max_tokens"] = int(os.getenv("EMBEDDING_MAX_TOKENS", "8192"))
+        embedding_kwargs["tokenizer"] = tiktoken.get_encoding("cl100k_base")
+
     embedding_model_instance = AutoEmbeddings.get_embeddings(
         EMBEDDING_MODEL,
         **embedding_kwargs,
     )
+
+    # Truncate embeddings for Matryoshka models (LM Studio ignores dimensions param)
+    if EMBEDDING_DIMENSIONS:
+        _target_dim = int(EMBEDDING_DIMENSIONS)
+        _original_embed = embedding_model_instance.embed
+        _original_embed_batch = embedding_model_instance.embed_batch
+
+        def _truncated_embed(text, _orig=_original_embed, _dim=_target_dim):
+            return _orig(text)[:_dim]
+
+        def _truncated_embed_batch(texts, _orig=_original_embed_batch, _dim=_target_dim):
+            return [v[:_dim] for v in _orig(texts)]
+
+        embedding_model_instance.embed = _truncated_embed
+        embedding_model_instance.embed_batch = _truncated_embed_batch
+    # The Chonkie embedding init creates OpenAI clients pointed at the
+    # embedding server (e.g. LM Studio). LiteLLM caches these clients
+    # and reuses them for LLM completion calls, ignoring per-call api_base.
+    # Flush the cache so LiteLLM creates fresh ones with the correct
+    # api_base when making LLM calls.
+    import litellm as _litellm
+    if hasattr(_litellm, 'in_memory_llm_clients_cache'):
+        _litellm.in_memory_llm_clients_cache.flush_cache()
+    # Also reset openai module defaults that may have been set
+    import openai as _openai
+    _openai.base_url = None
+    _openai.api_key = None
+
     chunker_instance = RecursiveChunker(
         chunk_size=getattr(embedding_model_instance, "max_seq_length", 512)
     )

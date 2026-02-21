@@ -4,7 +4,7 @@ import os
 
 from celery import Celery
 from celery.schedules import crontab
-from celery.signals import worker_process_init
+from celery.signals import task_prerun, worker_process_init
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -22,6 +22,36 @@ def init_worker(**kwargs):
 
     initialize_llm_router()
     initialize_image_gen_router()
+
+
+@task_prerun.connect
+def reset_litellm_logging_worker(**kwargs):
+    """Reset litellm's global logging worker before each task.
+
+    Each Celery task (with --pool=solo) creates and closes its own asyncio
+    event loop.  Litellm's GLOBAL_LOGGING_WORKER binds asyncio primitives
+    (Queue, Semaphore, Task) to the first event loop it sees but never
+    recreates them when that loop closes.  On the next task the stale
+    primitives raise "Event loop is closed", which wedges the worker.
+
+    Setting the primitives to None forces LoggingWorker.start() to
+    reinitialise them on the next task's fresh event loop.
+    """
+    try:
+        from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+        # Cancel the old worker task to prevent 'NoneType has no attribute release'
+        # warnings when the old coroutine gets GC'd
+        if GLOBAL_LOGGING_WORKER._worker_task is not None:
+            GLOBAL_LOGGING_WORKER._worker_task.cancel()
+
+        GLOBAL_LOGGING_WORKER._queue = None
+        GLOBAL_LOGGING_WORKER._worker_task = None
+        GLOBAL_LOGGING_WORKER._sem = None
+        GLOBAL_LOGGING_WORKER._running_tasks.clear()
+    except Exception:
+        # Forward-compatible: if litellm changes internals, don't crash.
+        pass
 
 
 # Get Celery configuration from environment
@@ -141,6 +171,8 @@ celery_app.conf.update(
         "index_bookstack_pages": {"queue": CONNECTORS_QUEUE},
         "index_obsidian_vault": {"queue": CONNECTORS_QUEUE},
         "index_composio_connector": {"queue": CONNECTORS_QUEUE},
+        # Connector deletion can be slow (bulk document removal)
+        "delete_connector_with_documents": {"queue": CONNECTORS_QUEUE},
         # Everything else (document processing, podcasts, reindexing,
         # schedule checker, cleanup) stays on the default fast queue.
     },

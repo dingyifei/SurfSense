@@ -18,6 +18,7 @@ Note: OAuth connectors (Gmail, Drive, Slack, etc.) support multiple accounts per
 Non-OAuth connectors (BookStack, GitHub, etc.) are limited to one per search space.
 """
 
+import asyncio
 import logging
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -89,7 +90,30 @@ logger = logging.getLogger(__name__)
 _heartbeat_redis_client: redis.Redis | None = None
 
 # Redis key TTL - notification is stale if no heartbeat in this time
-HEARTBEAT_TTL_SECONDS = 120  # 2 minutes
+HEARTBEAT_TTL_SECONDS = 900  # 15 minutes (embedding can take 7+ minutes for large documents)
+
+async def _connector_heartbeat_loop(notification_id: int):
+    """Background coroutine that refreshes Redis heartbeat every 60 seconds.
+
+    Keeps the heartbeat alive during long-running per-document processing
+    (LLM summarization, chunking, embedding) which can take several minutes.
+    Without this, the stale notification cleanup task marks the task as failed
+    after the 2-minute TTL expires.
+    """
+    key = _get_heartbeat_key(notification_id)
+    try:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                get_heartbeat_redis_client().setex(key, HEARTBEAT_TTL_SECONDS, "alive")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to refresh connector heartbeat for notification {notification_id}: {e}"
+                )
+    except asyncio.CancelledError:
+        pass  # Normal cancellation when task completes
+
+
 
 
 def get_heartbeat_redis_client() -> redis.Redis:
@@ -1261,6 +1285,7 @@ async def _run_indexing_with_notifications(
 
     notification = None
     connector_lock_acquired = False
+    heartbeat_bg_task = None
     # Track indexed count for retry notifications and heartbeat
     current_indexed_count = 0
 
@@ -1302,6 +1327,11 @@ async def _run_indexing_with_notifications(
                     heartbeat_key = _get_heartbeat_key(notification.id)
                     get_heartbeat_redis_client().setex(
                         heartbeat_key, HEARTBEAT_TTL_SECONDS, "0"
+                    )
+                    # Start background heartbeat loop to keep the key alive
+                    # during long per-document processing (LLM, chunking, embedding)
+                    heartbeat_bg_task = asyncio.ensure_future(
+                        _connector_heartbeat_loop(notification.id)
                     )
                 except Exception as e:
                     logger.warning(f"Failed to set initial Redis heartbeat: {e}")
@@ -1591,6 +1621,13 @@ async def _run_indexing_with_notifications(
             except Exception as notif_error:
                 logger.error(f"Failed to update notification: {notif_error!s}")
     finally:
+        # Cancel background heartbeat loop
+        if heartbeat_bg_task is not None:
+            heartbeat_bg_task.cancel()
+            try:
+                await heartbeat_bg_task
+            except (asyncio.CancelledError, Exception):
+                pass
         # Clean up Redis heartbeat key when task completes (success or failure)
         if notification:
             try:

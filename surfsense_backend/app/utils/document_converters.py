@@ -12,18 +12,23 @@ def get_model_context_window(model_name: str) -> int:
     try:
         model_info = get_model_info(model_name)
         context_window = model_info.get("max_input_tokens")
-        # Handle case where key exists but value is None
         if context_window is None:
-            print(
-                f"Warning: max_input_tokens is None for {model_name}, using default 4096 tokens."
-            )
-            return 4096  # Conservative fallback
+            raise ValueError("max_input_tokens is None")
         return context_window
     except Exception as e:
+        import os
+        override = os.getenv("LLM_CONTEXT_WINDOW")
+        if override:
+            print(
+                f"Warning: Could not get model info for {model_name}, "
+                f"using LLM_CONTEXT_WINDOW={override}. Error: {e}"
+            )
+            return int(override)
         print(
-            f"Warning: Could not get model info for {model_name}, using default 4096 tokens. Error: {e}"
+            f"Warning: Could not get model info for {model_name}, "
+            f"using default 4096 tokens. Error: {e}"
         )
-        return 4096  # Conservative fallback
+        return 4096
 
 
 def optimize_content_for_context_window(
@@ -146,7 +151,18 @@ async def generate_document_summary(
     else:
         enhanced_summary_content = summary_content
 
-    summary_embedding = config.embedding_model_instance.embed(enhanced_summary_content)
+    # Run embedding in a thread to keep the event loop responsive
+    import asyncio
+    import concurrent.futures
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    _loop = asyncio.get_event_loop()
+    summary_embedding = await asyncio.wait_for(
+        _loop.run_in_executor(
+            _executor, config.embedding_model_instance.embed, enhanced_summary_content
+        ),
+        timeout=30,
+    )
+    _executor.shutdown(wait=False)
 
     return enhanced_summary_content, summary_embedding
 
@@ -161,13 +177,42 @@ async def create_document_chunks(content: str) -> list[Chunk]:
     Returns:
         List of Chunk objects with embeddings
     """
-    return [
-        Chunk(
-            content=chunk.text,
-            embedding=config.embedding_model_instance.embed(chunk.text),
-        )
-        for chunk in config.chunker_instance.chunk(content)
-    ]
+    import asyncio
+    import concurrent.futures
+    import logging
+
+    logger = logging.getLogger(__name__)
+    chunks_list = config.chunker_instance.chunk(content)
+    logger.info(f"Chunking produced {len(chunks_list)} chunks from {len(content)} chars")
+
+    result = []
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_event_loop()
+
+    for i, chunk in enumerate(chunks_list):
+        try:
+            # Run synchronous embed() in a thread so the event loop stays responsive
+            # This allows heartbeat coroutines and other tasks to run
+            embedding = await asyncio.wait_for(
+                loop.run_in_executor(
+                    executor, config.embedding_model_instance.embed, chunk.text
+                ),
+                timeout=30,  # 30s timeout per chunk embedding
+            )
+            result.append(Chunk(content=chunk.text, embedding=embedding))
+        except asyncio.TimeoutError:
+            logger.warning(f"Embedding timeout for chunk {i}/{len(chunks_list)} ({len(chunk.text)} chars), skipping")
+            continue
+        except Exception as e:
+            logger.warning(f"Embedding error for chunk {i}/{len(chunks_list)}: {e}, skipping")
+            continue
+
+        if (i + 1) % 50 == 0:
+            logger.info(f"Embedded {i + 1}/{len(chunks_list)} chunks")
+
+    executor.shutdown(wait=False)
+    logger.info(f"Embedding complete: {len(result)}/{len(chunks_list)} chunks")
+    return result
 
 
 async def convert_element_to_markdown(element) -> str:

@@ -9,6 +9,7 @@ Implements 2-phase document status updates for real-time UI feedback:
 - Phase 2: Process each document: pending → processing → ready/failed
 """
 
+import os
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -47,6 +48,85 @@ HEARTBEAT_INTERVAL_SECONDS = 30
 # Maximum tokens for a single digest before splitting
 # Most LLMs can handle 128k+ tokens now, but we'll be conservative
 MAX_DIGEST_CHARS = 500_000  # ~125k tokens
+
+# File extensions to include when chunking repo content for embedding.
+# Source code + documentation only — skip data, binaries, lock files, generated code.
+CHUNK_ALLOWED_EXTENSIONS = {
+    # Python
+    ".py", ".pyx", ".pyi", ".ipynb",
+    # JavaScript / TypeScript
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    # Web
+    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".vue", ".svelte",
+    # Java / JVM
+    ".java", ".kt", ".kts", ".scala", ".groovy", ".clj",
+    # C / C++
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".cxx", ".hxx",
+    # Go
+    ".go",
+    # Rust
+    ".rs",
+    # Ruby
+    ".rb", ".erb",
+    # PHP
+    ".php",
+    # Swift / Objective-C
+    ".swift", ".m", ".mm",
+    # Shell
+    ".sh", ".bash", ".zsh", ".fish",
+    # Lua
+    ".lua",
+    # R
+    ".r", ".R",
+    # Julia
+    ".jl",
+    # Haskell / ML
+    ".hs", ".ml", ".mli", ".fs", ".fsx",
+    # Elixir / Erlang
+    ".ex", ".exs", ".erl",
+    # SQL
+    ".sql",
+    # Documentation
+    ".md", ".rst", ".txt", ".adoc",
+    # Config (small, useful for context)
+    ".toml", ".yaml", ".yml",
+}
+
+# Gitingest file separator (48 '=' chars per gitingest source)
+_GITINGEST_SEPARATOR = "=" * 48
+_NEWLINE = chr(10)
+
+
+def _filter_content_by_filetype(content: str) -> str:
+    """Filter gitingest content to only include files with allowed extensions.
+
+    Gitingest format per file:
+        ================================================
+        FILE: path/to/file.py
+        ================================================
+        <file content>
+    """
+    blocks = content.split(_GITINGEST_SEPARATOR)
+    kept = []
+    i = 0
+    while i < len(blocks):
+        block = blocks[i]
+        block_lines = block.strip().splitlines()
+        if block_lines and block_lines[0].startswith("FILE:"):
+            filepath = block_lines[0].split("FILE:", 1)[1].strip()
+            ext = os.path.splitext(filepath)[1].lower()
+            if ext in CHUNK_ALLOWED_EXTENSIONS:
+                if i + 1 < len(blocks):
+                    kept.append(
+                        _GITINGEST_SEPARATOR + _NEWLINE
+                        + block
+                        + _GITINGEST_SEPARATOR + _NEWLINE
+                        + blocks[i + 1]
+                    )
+                    i += 2
+                    continue
+        i += 1
+    return _NEWLINE.join(kept)
 
 
 async def index_github_repos(
@@ -391,9 +471,18 @@ async def index_github_repos(
                         summary_text
                     )
 
-                # Chunk the full digest content for granular search
+                # Chunk digest content for granular search (limit to MAX_DIGEST_CHARS
+                # to keep embedding time reasonable — 500K chars ≈ 1000 chunks ≈ 12 min)
+                chunk_content = _filter_content_by_filetype(digest.content)
+                logger.info(
+                    f"Filtered chunk content: {len(digest.content)} -> "
+                    f"{len(chunk_content)} chars (source + docs only)"
+                )
+                if len(chunk_content) > MAX_DIGEST_CHARS:
+                    chunk_content = chunk_content[:MAX_DIGEST_CHARS]
+                    logger.info(f"Truncated chunk content to {MAX_DIGEST_CHARS} chars")
                 try:
-                    chunks_data = await create_document_chunks(digest.content)
+                    chunks_data = await create_document_chunks(chunk_content)
                 except Exception as chunk_err:
                     logger.error(
                         f"Failed to chunk repository {repo_full_name}: {chunk_err}"
